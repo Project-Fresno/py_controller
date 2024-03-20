@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 
+from std_msgs.msg import Bool
 from nav_msgs.msg import Path
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
@@ -29,9 +30,10 @@ class PurePursuit(Node):
             Odometry, "odom", self.odom_callback, 10
         )
         self.path_subscriber = self.create_subscription(
-            Path, "plan", self.path_callback, 10
+            Path, "path", self.path_callback, 10
         )
-        self.cmd_vel_publisher = self.create_publisher(Twist, "ro_vel", 10)
+        self.cmd_vel_publisher = self.create_publisher(Twist, "cmd_vel", 10)
+        self.status_publisher = self.create_publisher(Bool, "goal_reached", 10)
         self.timer = self.create_timer(50 / 1000, self.timer_callback)
 
         self.odom = Odometry()
@@ -56,13 +58,15 @@ class PurePursuit(Node):
 
     def timer_callback(self):
 
-        tolerance = 0.1
+        tolerance = 0.5
         lookAheadDis = 0.2
-        linearVel = 2
+        linearVel = 0.3
 
         # extract currentX and currentY
         currentX = self.odom.pose.pose.position.x
         currentY = self.odom.pose.pose.position.y
+
+        goal_reached = Bool()
 
         if (
             not self.path.poses
@@ -73,8 +77,15 @@ class PurePursuit(Node):
             cmd_vel.linear.x = 0.0
             cmd_vel.angular.z = 0.0
             self.cmd_vel_publisher.publish(cmd_vel)
+
             print("no path or goal reached: stopping")
+            goal_reached.data = True
+            self.status_publisher.publish(goal_reached)
+
             return
+
+        goal_reached.data = False
+        self.status_publisher.publish(goal_reached)
 
         # extract orientation
         _, _, currentHeading = euler_from_quaternion(
@@ -219,6 +230,7 @@ class PurePursuit(Node):
             * 180
             / np.pi
         )
+        # recheck if all this is is needed - should work with everything till print commented
         if absTargetAngle < 0:
             absTargetAngle += 360
 
@@ -226,6 +238,8 @@ class PurePursuit(Node):
         turnError = absTargetAngle - currentHeading
         if turnError > 180 or turnError < -180:
             turnError = -1 * sgn(turnError) * (360 - abs(turnError))
+
+        turnError *= np.pi / 180  # consider staying in radians in the first place
         print(
             "currentH, absAngle, err:",
             currentHeading,
@@ -235,20 +249,23 @@ class PurePursuit(Node):
         )
 
         # apply proportional controller
-        turnVel = Kp * turnError
+        turnVel1 = 0.3 * turnError
 
         # # experimental turnVel controller
-        # W = 0.15
-        # turnVel = 50 * W * math.sin(turnError) * linearVel / lookAheadDis
+        # W = 0.5709
+        # turnVel2 = W * math.sin(turnError) * linearVel / lookAheadDis # if using, add proportional controller output
+        R = lookAheadDis / (2 * math.sin(turnError))
+        turnVel2 = linearVel / R
+        print("pure turnvel: ", turnVel2)
 
         # model: 200rpm drive with 18" width
         #               rpm   /s  circ   feet
-        maxLinVel = 200 / 60 * np.pi  # * 4 / 12
+        maxLinVel = 1.0  # 200 / 60 * np.pi  # * 4 / 12
         #               rpm   /s  center angle   deg
-        maxTurnVel = 200 / 60 * np.pi * 4 / 9  # * 180 / np.pi
+        maxTurnVel = 5  # 200 / 60 * np.pi * 4 / 9  # * 180 / np.pi
 
-        final_linear_vel = linearVel / 100 * maxLinVel
-        final_angular_vel = min(4, turnVel / 100 * maxTurnVel)
+        final_linear_vel = min(maxLinVel, linearVel)  # change to k * R * someVel
+        final_angular_vel = sgn(turnVel2) * min(maxTurnVel, abs(turnVel2))
 
         print("linear, angular:", final_linear_vel, final_angular_vel)
 
